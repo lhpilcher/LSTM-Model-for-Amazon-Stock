@@ -1,0 +1,119 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dropout, Dense
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+data = pd.read_csv('AMZN_1997-05-15_2025-02-21.csv')
+data['date'] = pd.to_datetime(data['date'], utc=True)
+features = ['adj_close', 'volume']
+df = data[features].interpolate(method='linear')
+
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df)
+
+# Create time series dataset
+def create_dataset(data, time_step=60):
+    X, Y = [], []
+    for i in range(len(data) - time_step):
+        X.append(data[i:i+time_step])
+        Y.append(data[i+time_step, 0])
+    return np.array(X), np.array(Y)
+
+time_step = 60
+X, Y = create_dataset(scaled_data, time_step)
+train_size = int(len(X) * 0.8)
+X_train, Y_train = X[:train_size], Y[:train_size]
+X_test, Y_test = X[train_size:], Y[train_size:]
+
+model = Sequential([
+    LSTM(100, return_sequences=False, input_shape=(time_step, len(features))),
+    Dropout(0.2),
+    Dense(50, activation='relu'),
+    Dense(1)
+])
+
+model.compile(optimizer='adam', loss='mean_squared_error')
+
+# Train model
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
+]
+
+history = model.fit(X_train, Y_train, epochs=50, batch_size=32, validation_data=(X_test, Y_test), callbacks=callbacks, verbose=1)
+
+# Predict test data
+test_pred = model.predict(X_test)
+Y_test_inv = scaler.inverse_transform(np.concatenate([Y_test.reshape(-1, 1), np.zeros((len(Y_test), 1))], axis=1))[:, 0]
+test_pred_inv = scaler.inverse_transform(np.concatenate([test_pred, np.zeros((len(test_pred), 1))], axis=1))[:, 0]
+
+# Plot test prediction
+plt.figure(figsize=(14, 6))
+plt.plot(data['date'][train_size + time_step:], Y_test_inv, label='Actual Price', color='blue')
+plt.plot(data['date'][train_size + time_step:], test_pred_inv, label='LSTM Prediction', color='red')
+plt.title('LSTM Price Prediction')
+plt.xlabel('Date')
+plt.ylabel('Stock Price (USD)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+predictions = []
+last_sequence = scaled_data[-time_step:].copy()
+
+for i in range(30):
+    input_seq = last_sequence.reshape(1, time_step, len(features))
+    pred_price = model.predict(input_seq, verbose=0)[0, 0]
+
+    volatility_noise = np.random.normal(loc=0.0, scale=0.01) 
+    pred_price += pred_price * volatility_noise
+
+    # Add downward bias in drift direction
+    drift_direction = np.random.choice([-1, 1], p=[0.7, 0.3]) 
+    drift_magnitude = np.random.uniform(0.005, 0.015) 
+    pred_price_with_drift = pred_price * (1 + drift_direction * drift_magnitude)
+
+    predictions.append(pred_price_with_drift)
+
+    # Simulate realistic volume
+    last_volumes = last_sequence[-5:, 1]
+    avg_volume = last_volumes.mean()
+    volume_noise = np.random.normal(loc=0.0, scale=0.03)  
+    next_volume = max(avg_volume * (1 + volume_noise), 0)
+
+    next_point = np.array([[pred_price_with_drift, next_volume]])
+    last_sequence = np.vstack([last_sequence[1:], next_point])
+
+# Inverse scaling
+pred_array = np.array(predictions).reshape(-1, 1)
+zeros_array = np.zeros((30, 1))
+combined = np.concatenate([pred_array, zeros_array], axis=1)
+predicted_prices = scaler.inverse_transform(combined)[:, 0]
+
+last_date = data['date'].iloc[-1]
+future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30, freq='B')
+
+# Plot
+plt.figure(figsize=(14, 6))
+plt.plot(future_dates, predicted_prices, color='red', marker='o', linestyle='-', linewidth=2, markersize=5, label='Predicted Adjusted Close')
+
+for i, (date, price) in enumerate(zip(future_dates, predicted_prices)):
+    plt.annotate(f"{price:.2f}",
+                 (date, price),
+                 textcoords="offset points",
+                 xytext=(0, 8),
+                 ha='center',
+                 fontsize=8,
+                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.6))
+
+plt.title('Amazon - Next 30 Days Forecast')
+plt.xlabel('Date')
+plt.ylabel('Predicted Price (USD)')
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
